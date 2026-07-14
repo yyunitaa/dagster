@@ -1,0 +1,6 @@
+﻿code_servers:
+  local_startup_timeout: 600
+
+compute_logs:
+  module: dagster._core.storage.noop_compute_log_manager
+  class: NoOpComputeLogManager

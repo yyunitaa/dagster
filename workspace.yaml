@@ -1,0 +1,3 @@
+# Tells Dagster where the Definitions object lives.
+load_from:
+  - python_module: autometric.repository

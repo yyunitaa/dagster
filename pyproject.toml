@@ -1,0 +1,33 @@
+[project]
+name = "autometric"
+version = "0.1.0"
+description = "Autometric data pipeline — Dagster orchestration for the Silver/Gold/Feature layers."
+requires-python = ">=3.10"
+
+dependencies = [
+    "dagster",
+    "dagster-webserver",
+    "psycopg2-binary",
+    "pandas",
+    "numpy",
+    "redis",
+    "sentence-transformers",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "black",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["autometric*"]
+
+[tool.dagster]
+module_name = "autometric.repository"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

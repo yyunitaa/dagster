@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+.dagster_home/
+.tmp_dagster_home*/
+autometric_dashboard/
+*.zip
