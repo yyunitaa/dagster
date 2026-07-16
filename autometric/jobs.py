@@ -54,7 +54,7 @@ daily_pipeline_job = define_asset_job(
 daily_schedule = ScheduleDefinition(
     name="daily_pipeline_schedule",
     job=daily_pipeline_job,
-    cron_schedule="0 2 * * *",
+    cron_schedule="15 3 * * *",
     execution_timezone="Asia/Jakarta",
     description="Jalankan daily_pipeline_job tiap hari pukul 02:00 WIB.",
 )
