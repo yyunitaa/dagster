@@ -2,17 +2,25 @@
 Dagster sensors.
 
 new_account_sensor (Sensor Akun Baru)
-  Polling tiap 5 menit: "ada nggak akun connected yang datanya udah masuk
-  l0_raw tapi belum pernah diolah sampai l2_gold?" Kalau ada -> trigger
-  daily_pipeline_job (job yang SAMA dengan jadwal 02:00), jadi akun baru
-  nggak perlu nunggu jam 2 malam.
+  Polling tiap 1 menit: "ada nggak akun connected yang initial scrape-nya
+  udah SELESAI (ada log success), datanya udah masuk l0_raw, tapi belum
+  pernah diolah sampai l2_gold?" Kalau ada -> trigger daily_pipeline_job
+  (job yang SAMA dengan jadwal malam), jadi akun baru nggak perlu nunggu
+  run malam.
 
-  Kondisi trigger (idempotent, tanpa cursor):
+  Kondisi trigger (idempotent, tanpa cursor) -- tiga syarat, tiga peran:
     connected = true
     AND EXISTS raw post/media/video   (fb_post_snapshots / ig_media_snapshots / tt_video_snapshots)
+                                       -- "datanya beneran ada" (pagar anti log bohong)
     AND NOT EXISTS l2_gold.post_metric (brand_id = social_accounts.id, grain per-channel
                                         -- diverifikasi 2026-07-14: 20/20 match social_accounts,
                                         -- 0 match brands, plus ada FK eksplisit)
+                                       -- "belum diolah" (pembeda akun baru vs lama,
+                                       -- sekaligus tombol off otomatis setelah run selesai)
+    AND EXISTS initial_scrape_logs status='success'
+                                       -- "scrape sudah kelar" (gerbang anti data parsial;
+                                       -- ditulis backend SEKALI di AKHIR initial scrape,
+                                       -- lihat DDL 2026-07-19)
 
   Kenapa driver-nya social_accounts WHERE connected = true:
     - Tabel kecil, dan memisahkan akun competitor secara natural
@@ -64,24 +72,23 @@ WHERE sa.connected = true
   AND NOT EXISTS (
         SELECT 1 FROM l2_gold.post_metric pm WHERE pm.brand_id = sa.id
   )
-  -- OPSI DEBOUNCE (uncomment kalau mau nunggu scrape "anteng" dulu 10 menit,
-  -- biar pipeline nggak jalan pas initial scrape masih setengah jalan):
-  -- AND (
-  --   SELECT MAX(t.f) FROM (
-  --     SELECT MAX(r.fetched_at) AS f FROM l0_raw.fb_post_snapshots  r WHERE r.social_account_id = sa.id
-  --     UNION ALL
-  --     SELECT MAX(r.fetched_at)      FROM l0_raw.ig_media_snapshots r WHERE r.social_account_id = sa.id
-  --     UNION ALL
-  --     SELECT MAX(r.fetched_at)      FROM l0_raw.tt_video_snapshots r WHERE r.social_account_id = sa.id
-  --   ) t
-  -- ) < now() - interval '10 minutes'
+  -- GERBANG INITIAL SCRAPE (2026-07-19): row di initial_scrape_logs ditulis
+  -- backend SEKALI, DI AKHIR, setelah semua data initial scrape ter-commit
+  -- ke l0_raw. Ada row success = jaminan raw utuh -> aman diolah.
+  -- Tanpa row = scrape belum selesai / gagal -> sensor diam,
+  -- backstop tetap jadwal malam (full rebuild).
+  AND EXISTS (
+        SELECT 1 FROM public.initial_scrape_logs l
+        WHERE l.social_account_id = sa.id
+          AND l.status = 'success'
+  )
 ORDER BY sa.id
 """
 
 
 @sensor(
     job=daily_pipeline_job,
-    minimum_interval_seconds=300,
+    minimum_interval_seconds=60,
     default_status=DefaultSensorStatus.RUNNING,
     description=(
         "Trigger daily_pipeline_job saat ada akun connected yang datanya "
@@ -101,7 +108,10 @@ def new_account_sensor(
         conn.close()
 
     if not rows:
-        return SkipReason("Tidak ada akun baru (semua akun connected sudah punya data gold).")
+        return SkipReason(
+            "Tidak ada akun baru yang siap diolah "
+            "(semua sudah punya data gold, atau initial scrape belum ada log success)."
+        )
 
     account_ids = sorted(str(r[0]) for r in rows)
     usernames = [r[1] for r in rows]
