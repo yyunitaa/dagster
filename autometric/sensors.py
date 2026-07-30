@@ -42,8 +42,59 @@ new_account_sensor (Sensor Akun Baru)
   Run susulan jadi redundant full-rebuild -- boros dikit, tapi aman
   (nggak ada TRUNCATE tabrakan).
 
-Sensor lama dari blueprint Fase 5 (csv_upload_sensor, replica_lag_sensor)
-gugur -- alasan lengkap ada di history git / dokumentasi Dagster.
+csv_upload_sensor (Sensor Upload CSV) -- ditambahkan 30 Juli 2026
+  Polling tiap 1 menit: "ada nggak baris baru status='success' di
+  public.csv_upload_logs yang belum pernah ditrigger?" Kalau ada -> trigger
+  daily_pipeline_job (job yang SAMA persis), jadi data csv yang baru
+  di-upload nggak perlu nunggu run malam.
+
+  BEDA DESAIN dari new_account_sensor (kenapa nggak bisa pakai NOT EXISTS):
+    Grain new_account_sensor per-akun, dan begitu akun itu sudah punya row
+    di l2_gold.post_metric, NOT EXISTS otomatis jadi tombol-off -- akun itu
+    nggak akan trigger lagi.
+    Grain csv_upload_sensor per-BARIS-UPLOAD (bisa banyak file per batch_id,
+    dan brand yang sama bisa upload csv berkali-kali). Kalau dipaksa pakai
+    NOT EXISTS ke gold, upload csv KEDUA untuk brand yang sama nggak akan
+    pernah trigger, karena gold brand itu udah keburu keisi dari upload
+    pertama. Makanya sensor ini pakai CURSOR (context.cursor), bukan
+    NOT EXISTS: sensor nyimpen created_at row terakhir yang udah ditrigger,
+    lalu tiap poll cuma ambil row yang created_at-nya lebih baru dari itu.
+
+  Kenapa cukup 1 gerbang (status='success') tanpa EXISTS raw / NOT EXISTS gold:
+    - status di csv_upload_logs cuma keisi kalau proses tulis ke l0_raw
+      beneran udah selesai (success/failed/skipped) -- nggak ada state
+      "in progress" yang perlu difilter (CHECK constraint cuma izinkan
+      3 nilai itu, dan row baru muncul setelah proses kelar).
+    - failed & skipped sengaja DIABAIKAN (dianggap "tidak ada apa-apa buat
+      diproses"), backstop tetap jadwal malam kalau row itu nantinya
+      di-reupload dan sukses.
+
+  Batch semantics (diverifikasi manual dgn dev, 30 Juli 2026):
+    - 1 batch_id = 1 aksi upload, BISA berisi banyak file -> banyak row,
+      berbagi batch_id yang sama.
+    - Row-row dalam 1 batch bisa muncul dengan jeda waktu, TAPI cuma
+      beda sepersekian detik -- jauh di bawah interval polling 60 detik,
+      jadi praktis semua row 1 batch ketangkep di poll yang sama.
+      Makanya sensor ini sengaja TIDAK nunggu "semua row di batch selesai"
+      (nggak ada cara murah buat tau itu -- nggak ada kolom "total file
+      per batch" di tabel ini) -- cukup ambil apa pun yang lolos filter
+      created_at > cursor di tiap poll, per BARIS (bukan per batch).
+
+  Inisialisasi cursor (Opsi A, disepakati 30 Juli 2026):
+    Tick pertama kali sensor RUNNING, context.cursor masih None -> sensor
+    TIDAK memproses histori csv_upload_logs yang lama. Cursor langsung
+    diisi ke NOW() (dari DB, bukan waktu Python, biar konsisten timezone),
+    lalu sensor return SkipReason. Baru row-row SETELAH titik itu yang
+    akan memicu run. Ini sesuai kebutuhan asli ("kalau ada baris BARU"),
+    bukan mau reprocessing histori lama.
+
+  run_key: gabungan sorted row id ("csv_upload:<id1>,<id2>") -- pola sama
+  seperti new_account_sensor, prefix beda supaya gampang dibedakan di UI.
+
+Sensor lama dari blueprint Fase 5 (replica_lag_sensor) masih gugur --
+alasan lengkap ada di history git / dokumentasi Dagster. csv_upload_sensor
+tadinya juga masuk daftar gugur, tapi diaktifkan lagi 30 Juli 2026 karena
+kebutuhan riil upload csv manual (bukan cuma ingest API Meta/TikTok).
 """
 
 import hashlib
@@ -138,4 +189,89 @@ def new_account_sensor(
     )
 
 
-sensors = [new_account_sensor]
+# --- csv_upload_sensor -----------------------------------------------------
+# Lihat penjelasan lengkap di docstring modul di atas.
+
+CSV_UPLOAD_SQL = """
+SELECT id, created_at, file_name
+FROM public.csv_upload_logs
+WHERE status = 'success'
+  AND created_at > %s
+ORDER BY created_at ASC
+"""
+
+
+@sensor(
+    job=daily_pipeline_job,
+    minimum_interval_seconds=60,
+    default_status=DefaultSensorStatus.RUNNING,
+    description=(
+        "Trigger daily_pipeline_job saat ada baris baru status='success' di "
+        "public.csv_upload_logs (upload csv baru masuk ke l0_raw)."
+    ),
+)
+def csv_upload_sensor(
+    context: SensorEvaluationContext,
+    postgres: PostgresResource,
+):
+    conn = postgres.get_conn()
+    try:
+        with conn.cursor() as cur:
+            if context.cursor is None:
+                # Tick pertama sensor ini RUNNING: OPSI A -- jangan proses
+                # histori csv_upload_logs yang lama. Cursor diinisialisasi
+                # ke NOW() dari DB (bukan waktu Python) supaya konsisten
+                # dengan timezone/clock server DB.
+                cur.execute("SELECT NOW()")
+                (now,) = cur.fetchone()
+                context.update_cursor(now.isoformat())
+                return SkipReason(
+                    "Inisialisasi pertama: cursor diset ke waktu sekarang. "
+                    "Histori csv_upload_logs lama tidak diproses, hanya baris "
+                    "baru setelah titik ini yang akan memicu run."
+                )
+
+            cur.execute(CSV_UPLOAD_SQL, (context.cursor,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return SkipReason(
+            "Tidak ada baris baru status='success' di csv_upload_logs "
+            "sejak cursor terakhir."
+        )
+
+    row_ids = sorted(str(r[0]) for r in rows)
+    file_names = [r[2] for r in rows]
+    latest_created_at = max(r[1] for r in rows)
+
+    joined = ",".join(row_ids)
+    run_key = f"csv_upload:{joined}"
+    if len(run_key) > 200:
+        # banyak baris sekaligus (misal 1 batch banyak file) -> run_key
+        # di-hash biar nggak kepanjangan, determinismenya tetap sama
+        # (sorted ids).
+        run_key = "csv_upload:" + hashlib.sha1(joined.encode()).hexdigest()
+
+    context.log.info(
+        "Upload csv sukses terdeteksi (%d baris): %s -> trigger daily_pipeline_job",
+        len(rows),
+        ", ".join(file_names),
+    )
+
+    # Majukan cursor SETELAH baris ini diproses jadi RunRequest, supaya
+    # kalau run-nya nanti gagal, baris ini tidak "hilang" (Dagster yang
+    # akan dedupe run_key kalau di-retry, bukan sensor yang skip lagi).
+    context.update_cursor(latest_created_at.isoformat())
+
+    return RunRequest(
+        run_key=run_key,
+        tags={
+            "trigger": "csv_upload_sensor",
+            "csv_files": ", ".join(file_names)[:250],
+        },
+    )
+
+
+sensors = [new_account_sensor, csv_upload_sensor]
