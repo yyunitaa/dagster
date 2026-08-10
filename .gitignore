@@ -7,3 +7,5 @@ __pycache__/
 .tmp_dagster_home*/
 autometric_dashboard/
 *.zip
+.nux/
+.claude/settings.local.json

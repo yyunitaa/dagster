@@ -7,19 +7,19 @@ daily_pipeline_job
   Dagster otomatis menjalankan asset sesuai urutan dependency, jadi job ini cukup
   menyeleksi SEMUA asset (AssetSelection.all()) tanpa mendaftar manual satu per satu.
 
-  Yang ikut ke-materialize:
-    - 6 harmonization assets (raw -> l0_harmonization.*)
-    - 6 silver assets        (l0_harmonization -> l1_silver.*)
-    - 1 feature asset        (comment_relevance_scores + word_frequencies, REPLACE + invalidate Redis)
-    - 8 gold mart assets     (l2_gold.* via sp_build_*)
+  Yang ikut ke-materialize: seluruh asset terdaftar di repository.py
+  (harmonization -> silver -> feature/NLP -> gold + competitor assets).
+  Daftar tidak dihitung manual di sini agar tidak basi tiap ada asset baru.
   l0_raw adalah SourceAsset (diisi ingest API di luar Dagster) -> tidak dimaterialisasi,
   hanya jadi titik awal lineage.
 
 daily_schedule
-  Cron 02:00 setiap hari, timezone Asia/Jakarta (WIB).
-  Alasan jam 02:00: memberi jarak setelah aktivitas ingest API malam hari, dan
-  dijalankan saat trafik rendah. Seluruh transform (harmonization -> gold) kini
-  dipicu Dagster di sini, BUKAN pg_cron.
+  Cron 03:15 setiap hari, timezone Asia/Jakarta (WIB).
+  Alasan jam 03:15: scraper competitor (Apify) jalan 03:00 WIB dan datanya
+  konsisten landing ~03:01-03:03 WIB. Buffer sampai 03:15 memastikan pipeline
+  tidak makan data competitor yang masih setengah ter-ingest.
+  (Main brand di-scrape 02:00 via Meta Graph -- sudah lama selesai saat 03:15.)
+  Seluruh transform (harmonization -> gold) dipicu Dagster di sini, BUKAN pg_cron.
 
 CATATAN — campaign analysis (Langkah 20):
   Halaman "Campaign Analysis" bersifat on-demand (user memilih subset post lalu
@@ -50,13 +50,13 @@ daily_pipeline_job = define_asset_job(
 )
 
 
-# --- Schedule: 02:00 WIB tiap hari ---------------------------------------
+# --- Schedule: 03:15 WIB tiap hari ---------------------------------------
 daily_schedule = ScheduleDefinition(
     name="daily_pipeline_schedule",
     job=daily_pipeline_job,
     cron_schedule="15 3 * * *",
     execution_timezone="Asia/Jakarta",
-    description="Jalankan daily_pipeline_job tiap hari pukul 02:00 WIB.",
+    description="Jalankan daily_pipeline_job tiap hari pukul 03:15 WIB (buffer setelah scrape competitor 03:00).",
 )
 
 

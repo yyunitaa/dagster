@@ -9,7 +9,7 @@ Env vars (set di .env, JANGAN commit .env):
 
 Orkestrasi penuh di Dagster (TIDAK ada pg_cron):
   l0_raw (source) -> harmonization -> silver -> feature -> gold
-Dipicu daily_pipeline_job pada 02:00 WIB (lihat jobs.py).
+Dipicu daily_pipeline_job pada 03:15 WIB (lihat jobs.py).
 """
 from dotenv import load_dotenv
 load_dotenv()
@@ -59,8 +59,8 @@ defs = Definitions(
     ],
     asset_checks=[*silver_freshness_checks],   # Langkah 11: freshness 25 jam
     jobs=jobs,             # Langkah 19: daily_pipeline_job
-    schedules=schedules,   # Langkah 19: daily_pipeline_schedule (02:00 WIB)
-    sensors=sensors,       # new_account_sensor (trigger pipeline saat akun baru punya raw tapi belum gold)
+    schedules=schedules,   # Langkah 19: daily_pipeline_schedule (03:15 WIB)
+    sensors=sensors,       # new_account_sensor (raw ada + gold kosong + initial_scrape_logs success -> trigger pipeline)
     resources={
         "postgres": PostgresResource(
             connection_string=os.environ["AUTOMETRIC_DB_URL"],
