@@ -12,10 +12,21 @@ PERUBAHAN (orkestrasi penuh di Dagster):
 Pemetaan dependency entitas:
   unified_post        <- harmonized_post
   unified_comment     <- harmonized_comment  (DAN unified_post; Langkah 10)
-  unified_audience    <- harmonized_audience
-  unified_profile     <- harmonized_profile
+  unified_audience    <- normalized_audience_percentage  (bukan langsung
+                          harmonized_audience -- lihat catatan 2026-08-19)
+  unified_profile     <- gapfilled_profile_dates  (bukan langsung
+                          harmonized_profile -- lihat catatan 2026-08-19)
   unified_story       <- harmonized_story
   unified_tagged_post <- harmonized_tagged_post   (IG-only, UGC)
+
+CATATAN 2026-08-19 (audit l0_raw -> l2_gold):
+  unified_profile dan unified_audience sekarang depend ke asset TAMBAHAN
+  (gapfilled_profile_dates, normalized_audience_percentage di
+  harmonization_assets.py), BUKAN langsung ke harmonized_profile/
+  harmonized_audience -- supaya gap-fill & koreksi pembulatan SELALU jalan
+  duluan sebelum Silver baca datanya. Kedua asset baru itu tetap depend
+  transitif ke harmonized_profile/harmonized_audience, jadi urutan raw ->
+  harmonization tetap terjaga.
 
 Freshness (Langkah 11): 25 jam via build_last_update_freshness_checks.
   CATATAN: unified_tagged_post TIDAK diikutkan freshness check — UGC sifatnya
@@ -34,10 +45,10 @@ from autometric.resources import PostgresResource
 from autometric.assets.harmonization_assets import (
     harmonized_post,
     harmonized_comment,
-    harmonized_profile,
-    harmonized_audience,
     harmonized_story,
     harmonized_tagged_post,
+    gapfilled_profile_dates,
+    normalized_audience_percentage,
 )
 
 
@@ -74,9 +85,14 @@ def unified_comment(postgres: PostgresResource) -> Output:
 
 @asset(
     group_name="silver",
-    deps=[harmonized_audience],
+    deps=[normalized_audience_percentage],
     kinds={"postgres"},
-    description="Sinkronkan l1_silver.unified_audience via sp_sync_unified_audience(). Independen.",
+    description=(
+        "Sinkronkan l1_silver.unified_audience via sp_sync_unified_audience() "
+        "(union instagram + facebook + tiktok, lihat catatan 2026-08-19). "
+        "Depend ke normalized_audience_percentage supaya koreksi drift "
+        "pembulatan sudah jalan duluan."
+    ),
 )
 def unified_audience(postgres: PostgresResource) -> Output:
     return _sync(postgres, "sp_sync_unified_audience", "unified_audience")
@@ -84,9 +100,13 @@ def unified_audience(postgres: PostgresResource) -> Output:
 
 @asset(
     group_name="silver",
-    deps=[harmonized_profile],
+    deps=[gapfilled_profile_dates],
     kinds={"postgres"},
-    description="Sinkronkan l1_silver.unified_profile via sp_sync_unified_profile(). Independen.",
+    description=(
+        "Sinkronkan l1_silver.unified_profile via sp_sync_unified_profile(). "
+        "Depend ke gapfilled_profile_dates (bukan langsung harmonized_profile) "
+        "supaya baris gap-filled ikut kebaca."
+    ),
 )
 def unified_profile(postgres: PostgresResource) -> Output:
     return _sync(postgres, "sp_sync_unified_profile", "unified_profile")

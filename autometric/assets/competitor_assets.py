@@ -31,7 +31,7 @@ from dagster import asset, Output
 from autometric.resources import PostgresResource
 from autometric.assets.harmonization_assets import (
     harmonized_post,
-    harmonized_profile,
+    gapfilled_profile_dates,
 )
 
 
@@ -62,9 +62,17 @@ def unified_competitor_post(postgres: PostgresResource) -> Output:
 
 @asset(
     group_name="silver",
-    deps=[harmonized_profile],
+    deps=[gapfilled_profile_dates],
     kinds={"postgres"},
-    description="Sinkronkan l1_silver.unified_competitor_profile_daily via sp_sync_unified_competitor_profile_daily(). Filter baris kompetitor dari tabel harmonization profile yang sama dipakai brand utama. Independen dari unified_competitor_post.",
+    description=(
+        "Sinkronkan l1_silver.unified_competitor_profile_daily via "
+        "sp_sync_unified_competitor_profile_daily(). Filter baris kompetitor "
+        "dari tabel harmonization profile yang sama dipakai brand utama. "
+        "Depend ke gapfilled_profile_dates (2026-08-19, bukan langsung "
+        "harmonized_profile) -- kompetitor paling sering kena gap tanggal "
+        "dari scraping yang gagal, jadi ini yang paling diuntungkan gap-fill. "
+        "Independen dari unified_competitor_post."
+    ),
 )
 def unified_competitor_profile_daily(postgres: PostgresResource) -> Output:
     return _sync(postgres, "sp_sync_unified_competitor_profile_daily", "unified_competitor_profile_daily")
