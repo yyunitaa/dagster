@@ -407,6 +407,15 @@ Konsekuensinya:
 - Kalau muncul akun baru **lain** sebelum yang gagal ke-handle → set berubah →
   `run_key` baru → run baru jalan. Karena gold pakai full rebuild
   (TRUNCATE + INSERT), akun yang tadi gagal ikut kebawa. Self-healing.
+  ⚠️ **Koreksi 2026-09-04:** ini cuma berlaku untuk asset yang masih TRUNCATE+INSERT
+  (`post_wordcloud`, dan `comment_relevance_scores`/`word_frequencies` di Feature
+  layer). 9 SP gold/silver leaderboard-snapshot (`community_contributors`,
+  `comment_relevance_distribution`, `posting_time_heatmap`, `post_comment_timeline`,
+  `ugc_tagged_posts`, `unified_competitor_post`, `unified_competitor_profile_daily`,
+  `competitor_post_metric`, `competitor_profile_metric_daily`) sudah diganti jadi
+  UPSERT — akun/post/user yang gagal atau sudah tidak dihasilkan sumber **tidak lagi**
+  otomatis ke-nyapu di run berikutnya, jadi self-healing di atas tidak berlaku
+  untuk mereka. Lihat `dokumentasi_silver_dan_gold_layer.md` §1/§4/§6 untuk detail per tabel.
 
 ### 6.5 Sensor yang Gugur dari Blueprint Fase 5
 

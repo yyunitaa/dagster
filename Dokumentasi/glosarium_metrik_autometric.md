@@ -20,7 +20,7 @@
 7. **Data kompetitor: `NULL` ≠ 0.** `NULL` berarti metrik **tidak tersedia** dari scraping publik (mis. comments FB, shares/saves IG). Tampilkan "–" atau "N/A", jangan nol.
 8. `post_metric.completion_rate` bertipe **text** (bukan numeric) — parse hati-hati di FE.
 9. `brand_metric_daily.video_views_sum` = duplikat `views_sum` (formula sama: `SUM(views)`). Pakai salah satu saja.
-10. `posting_time_heatmap` adalah snapshot **all-time** (tanpa filter tanggal, TRUNCATE tiap build) — bukan per-periode.
+10. `posting_time_heatmap` adalah snapshot **all-time** (tanpa filter tanggal) — bukan per-periode. ⚠️ Sejak 2026-09-04 SP-nya UPSERT (dulu TRUNCATE tiap build) — kombinasi weekday×hour yang postnya sudah hilang dari sumber bisa nyangkut dengan angka basi, tidak lagi otomatis ke-nol-kan tiap build.
 11. **Rumus formal semua metrik terhitung** (kontrak perhitungan untuk dev) ada di **§10** — teks tooltip di §1–8 hanya versi bahasa awamnya.
 
 ---

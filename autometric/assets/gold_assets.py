@@ -89,6 +89,9 @@ def mart_comment_activity(postgres: PostgresResource) -> Output:
     return _build(postgres, "sp_build_comment_activity", "comment_activity_daily")
 
 
+# 2026-09-04: procedure diubah dari TRUNCATE+INSERT ke UPSERT -- leaderboard nggak lagi
+# full rebuild tiap run; user yang jatuh dari window/ranking TIDAK otomatis hilang,
+# rank_in_window/composite_score lama bisa nyangkut basi.
 @asset(
     group_name="gold",
     deps=[_POST, _COMMENT, _FEATURE],   # Langkah 17: setelah NLP
@@ -139,6 +142,8 @@ def mart_tiktok_churn(postgres: PostgresResource) -> Output:
     return _build(postgres, "sp_build_tiktok_churn", "tiktok_churn_daily")
 
 
+# 2026-09-04: procedure diubah dari TRUNCATE+INSERT ke UPSERT -- tagged post yang
+# tag-nya dicabut/dihapus dari sumber TIDAK otomatis hilang dari tabel ini lagi.
 @asset(
     group_name="gold",
     deps=[_TAGGED],
@@ -183,7 +188,10 @@ def audience_geo_daily(postgres: PostgresResource) -> Output:
 
 # --- Posting time heatmap (Gap #3 PETA_GOLD_DASHBOARD) --------------------
 # Agregat weekday x hour (WIB) dari unified_post. post_date sudah WIB wall-clock,
-# jadi EXTRACT(DOW/HOUR) langsung benar. Full rebuild (TRUNCATE+INSERT di procedure).
+# jadi EXTRACT(DOW/HOUR) langsung benar.
+# 2026-09-04: procedure diubah dari TRUNCATE+INSERT ke UPSERT (ON CONFLICT DO UPDATE).
+# Bukan full rebuild lagi -- bucket weekday x hour yang post-nya sudah hilang dari
+# sumber TIDAK otomatis ke-nol-kan, bisa nyangkut dengan angka basi.
 # Melayani OVERVIEW -> Best Posting Times.
 @asset(
     group_name="gold",
@@ -192,7 +200,8 @@ def audience_geo_daily(postgres: PostgresResource) -> Output:
     description=(
         "l2_gold.posting_time_heatmap (grain weekday x hour, WIB) via "
         "sp_build_posting_time_heatmap(). Best Posting Times (OVERVIEW). "
-        "Komponen additive; full rebuild. Developer query tabel ini langsung (Model 1)."
+        "Komponen additive; UPSERT (bukan full rebuild lagi sejak 2026-09-04). "
+        "Developer query tabel ini langsung (Model 1)."
     ),
 )
 def posting_time_heatmap(postgres: PostgresResource) -> Output:
@@ -223,6 +232,8 @@ def dim_content_pillar(postgres: PostgresResource) -> Output:
 # Distribusi komentar per tier relevance (High>75 / Mid 40-75 / Low<40) dari
 # feature.comment_relevance_scores. brand_id per-akun -> umbrella via brand_social_accounts
 # (pola sama community_contributors). Simpan count (FE hitung pct). AUDIENCE DEEP DIVE.
+# 2026-09-04: procedure diubah dari TRUNCATE+INSERT ke UPSERT -- tier yang commentnya
+# sudah 0 di run terbaru TIDAK ke-reset, bisa nyangkut dengan comment_count basi.
 @asset(
     group_name="gold",
     deps=[_FEATURE],
@@ -241,6 +252,8 @@ def comment_relevance_distribution(postgres: PostgresResource) -> Output:
 # Timeline komentar harian per post (WIB). bucket_date = sumbu absolut;
 # days_since_post = sumbu relatif (butuh JOIN ke unified_post untuk post_date).
 # CATATAN: pakai comment_date (sudah WIB), BUKAN comment_time (UTC).
+# 2026-09-04: procedure diubah dari TRUNCATE+INSERT ke UPSERT -- bucket tanggal yang
+# commentnya sudah dihapus dari sumber TIDAK ke-reset, bisa nyangkut dengan angka basi.
 @asset(
     group_name="gold",
     deps=[_COMMENT, _POST],

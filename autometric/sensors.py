@@ -36,6 +36,15 @@ new_account_sensor (Sensor Akun Baru)
     - Kalau muncul akun baru LAIN sebelum yang gagal ke-handle, set berubah ->
       run_key baru -> run baru jalan, dan karena gold full rebuild
       (TRUNCATE+INSERT), akun yang gagal tadi ikut kebawa. Self-healing.
+      ⚠️ KOREKSI 2026-09-04: self-healing ini cuma berlaku buat asset yang MASIH
+      TRUNCATE+INSERT (post_wordcloud, comment_relevance_scores/word_frequencies
+      di Feature). 9 SP leaderboard/snapshot (community_contributors,
+      comment_relevance_distribution, posting_time_heatmap, post_comment_timeline,
+      ugc_tagged_posts, unified_competitor_post, unified_competitor_profile_daily,
+      competitor_post_metric, competitor_profile_metric_daily) sudah diubah jadi
+      UPSERT -- akun yang gagal di run sebelumnya TIDAK otomatis ke-bersihin lagi
+      di tabel-tabel itu, data basi bisa nyangkut sampai akun itu berhasil diproses
+      ulang. Lihat dokumentasi_silver_dan_gold_layer.md untuk detail.
 
   Catatan overlap: kalau sensor kepicu pas run lain masih jalan,
   QueuedRunCoordinator (max_concurrent_runs: 1) bikin dia ngantri.

@@ -30,7 +30,8 @@ l0_raw → l0_harmonization → l1_silver → feature (NLP) → l2_gold → (Fas
 - **Hybrid ratio** — Gold menyimpan komponen additive (numerator + denominator) **dan** ratio harian jadi. Untuk rentang custom (7D/30D), hitung `SUM(numerator)/SUM(denominator)`; jangan rata-rata ratio harian (ratio tidak additive).
 - **WIB** — seluruh tanggal dinormalisasi ke `Asia/Jakarta`.
 - **Brand umbrella** — Silver memakai `brand_id = social_accounts.id` (per-akun). Mart Gold yang butuh level brand naik lewat `public.brand_social_accounts (social_account_id → brand_id)` dengan INNER JOIN (akun yang belum dipetakan tidak masuk — by design).
-- **Idempoten** — SP memakai UPSERT (`ON CONFLICT DO UPDATE` dengan guard `IS DISTINCT FROM`) untuk time-series, atau `TRUNCATE + INSERT` untuk snapshot/leaderboard/agregat kecil. Re-run otomatis backfill.
+- **Idempoten** — SP memakai UPSERT (`ON CONFLICT DO UPDATE` dengan guard `IS DISTINCT FROM`) untuk time-series. Re-run otomatis backfill.
+  ⚠️ **Perubahan 2026-09-04:** 9 SP snapshot/leaderboard yang tadinya `TRUNCATE + INSERT` (full rebuild tiap run) sudah diganti jadi UPSERT (`ON CONFLICT DO UPDATE`) — lihat daftar & catatan regresi di [§2](#2-layer-silver-l1_silver), [§4.7](#47-community_contributors), [§4.8](#48-comment_relevance_distribution), [§4.9](#49-post_comment_timeline), [§4.13](#413-posting_time_heatmap), [§4.16](#416-lain), dan [§6](#6-data-kompetitor-brand-vs-competitor). **Trade-off penting:** baris yang sumbernya sudah tidak menghasilkan data (post/akun dihapus, user jatuh dari leaderboard, tier kosong) TIDAK lagi otomatis hilang seperti sebelumnya — nyangkut sebagai data basi sampai dibersihkan manual/DELETE terpisah. Ini juga mematahkan mekanisme "self-healing" yang didokumentasikan di `sensors.py` (lihat §1.1 & catatan sensor) yang tadinya mengandalkan TRUNCATE untuk otomatis membersihkan akun yang gagal diproses.
 - **Data kompetitor punya jalur terpisah** — Silver & Gold dedicated (`unified_competitor_*`, `competitor_*`), tapi harmonization-nya **shared** dengan brand utama (bukan tabel terpisah). Detail di [§6](#6-data-kompetitor-brand-vs-competitor).
 
 **Timezone per tabel (penting, mudah keliru):**
@@ -87,7 +88,7 @@ Dikonfirmasi dari kode asset terbaru (`silver_assets.py`, `harmonization_assets.
 | Gold | `dim_content_pillar` | **`mart_pillar_performance`** (asset Gold, bukan Silver!) | ⚠️ Kalau `dim_content_pillar` somehow jalan sebelum `pillar_performance_daily` terisi, seed-nya kosong. |
 | Gold | `comment_relevance_distribution` | `comment_relevance_scores` (Feature) | |
 | Gold | `post_comment_timeline` | `unified_comment`, `unified_post` | |
-| Gold | `post_wordcloud` (Python) | `unified_comment` | TRUNCATE+INSERT, di luar `sp_build_*` |
+| Gold | `post_wordcloud` (Python) | `unified_comment` | TRUNCATE+INSERT, di luar `sp_build_*` (tidak diubah) |
 | Gold | `comment_sentiment_daily` | `comment_sentiment_scores` (Feature) | |
 | Gold | `comment_sentiment_post` | `comment_sentiment_scores` (Feature) | |
 | Kompetitor (Silver) | `unified_competitor_post` | `harmonized_post` (asset **sama** dengan brand utama) | |
@@ -369,7 +370,7 @@ Post yang men-tag brand (UGC). IG-only.
 
 ### `unified_competitor_post` — grain: 1 baris / (social_account_id, post_id) kompetitor
 
-**Builder:** `sp_sync_unified_competitor_post()` · **PK:** `(id)` surrogate · **UNIQUE:** `(social_account_id, post_id)` (ada, tapi **tidak dipakai** buat conflict target) · **Duplicate handling: TRUNCATE + INSERT** (beda dari konvensi Silver lain yang UPSERT — full rebuild tiap run, bukan incremental).
+**Builder:** `sp_sync_unified_competitor_post()` · **PK:** `(id)` surrogate · **UNIQUE:** `(social_account_id, post_id)` — **sekarang dipakai sebagai conflict target** (⚠️ diubah 2026-09-04 dari TRUNCATE+INSERT ke UPSERT) · **Duplicate handling: UPSERT** (`ON CONFLICT (social_account_id, post_id) DO UPDATE`). Konsisten sekarang dengan konvensi Silver lain. **Trade-off:** post kompetitor yang sudah tidak dihasilkan sumber (dihapus/akun di-disconnect) tidak lagi otomatis hilang — beda dari perilaku TRUNCATE sebelumnya.
 
 Detail lengkap + keterbatasan data per platform (`reach`/`comments`/`shares`/`saves` yang NULL per platform) ada di [§6.2](#62-layer-silver-kompetitor).
 
@@ -394,7 +395,7 @@ Detail lengkap + keterbatasan data per platform (`reach`/`comments`/`shares`/`sa
 
 ### `unified_competitor_profile_daily` — grain: 1 baris / (social_account_id, tanggal) kompetitor
 
-**Builder:** `sp_sync_unified_competitor_profile_daily()` · **PK:** `(id)` surrogate · **UNIQUE:** `(social_account_id, metric_date)` (ada, tapi juga **tidak dipakai** buat conflict target) · **Duplicate handling: TRUNCATE + INSERT.**
+**Builder:** `sp_sync_unified_competitor_profile_daily()` · **PK:** `(id)` surrogate · **UNIQUE:** `(social_account_id, metric_date)` — **sekarang dipakai sebagai conflict target** (⚠️ diubah 2026-09-04 dari TRUNCATE+INSERT ke UPSERT) · **Duplicate handling: UPSERT** (`ON CONFLICT (social_account_id, metric_date) DO UPDATE`). Trade-off sama seperti `unified_competitor_post` di atas.
 
 Lebih ramping dari `unified_profile` — nggak ada `lost_followers`, `net_growth`, `profile_reach`, dst. Detail di [§6.2](#62-layer-silver-kompetitor).
 
@@ -729,7 +730,7 @@ Isi: total_comments, positive_count, neutral_count, negative_count, avg_sentimen
 
 ### 4.7 `community_contributors`
 
-**Builder:** `sp_build_community_contributors()` · **PK:** `(brand_id, platform, window_days, normalized_username)` · **brand_id = umbrella** · **Duplicate handling: TRUNCATE + INSERT** (window/leaderboard snapshot, bukan time-series — re-hitung total tiap run).
+**Builder:** `sp_build_community_contributors()` · **PK:** `(brand_id, platform, window_days, normalized_username)` · **brand_id = umbrella** · **Duplicate handling: UPSERT** (`ON CONFLICT ... DO UPDATE`, ⚠️ diubah 2026-09-04 dari TRUNCATE+INSERT). **Trade-off:** ini leaderboard yang harusnya re-hitung total tiap run — user yang jatuh dari window (comment count/relevance turun, atau keluar window 7/30/90 hari) TIDAK lagi otomatis hilang dari tabel; `rank_in_window`/`composite_score`/`tier` lama bisa nyangkut basi sampai user itu muncul lagi di run berikutnya (yang akan menimpanya) atau dibersihkan manual.
 
 comments_count, likes_received, replies_sum, avg_relevance, composite_score, tier (super_fan ≥70 / active ≥40 / casual), rank_in_window. composite = 50% volume-normalized + 50% avg_relevance. Melayani Community (leaderboard) & Audience (top contributors).
 
@@ -752,7 +753,7 @@ comments_count, likes_received, replies_sum, avg_relevance, composite_score, tie
 
 ### 4.8 `comment_relevance_distribution`
 
-**Builder:** `sp_build_comment_relevance_distribution()` · **PK:** `(brand_id, platform, tier)` · **brand_id = umbrella** · **Duplicate handling: TRUNCATE + INSERT.**
+**Builder:** `sp_build_comment_relevance_distribution()` · **PK:** `(brand_id, platform, tier)` · **brand_id = umbrella** · **Duplicate handling: UPSERT** (`ON CONFLICT (brand_id, platform, tier) DO UPDATE`, ⚠️ diubah 2026-09-04 dari TRUNCATE+INSERT). **Trade-off:** kalau sebuah (brand, platform, tier) sudah tidak punya komentar lagi di run terbaru, baris lama dengan `comment_count` basi tetap nyangkut (tidak ter-zero-kan) sampai combo itu muncul lagi.
 
 comment_count. Tier: High >75, Mid 40–75, Low <40 (skala relevance 0–100). Simpan count; FE hitung % = count/SUM(count). Audience → Comment Relevance distribution. (Sample komentar per tier: FE JOIN `unified_comment ↔ comment_relevance_scores`.)
 
@@ -768,7 +769,7 @@ comment_count. Tier: High >75, Mid 40–75, Low <40 (skala relevance 0–100). S
 
 ### 4.9 `post_comment_timeline`
 
-**Builder:** `sp_build_post_comment_timeline()` · **PK:** `(platform, post_id, bucket_date)` (nggak ada `brand_id` di grain — post_id + platform udah unik) · **Duplicate handling: TRUNCATE + INSERT.**
+**Builder:** `sp_build_post_comment_timeline()` · **PK:** `(platform, post_id, bucket_date)` (nggak ada `brand_id` di grain — post_id + platform udah unik) · **Duplicate handling: UPSERT** (`ON CONFLICT (platform, post_id, bucket_date) DO UPDATE`, ⚠️ diubah 2026-09-04 dari TRUNCATE+INSERT). **Trade-off:** bucket tanggal yang commentnya sudah hilang (dihapus dari sumber) tetap nyangkut dengan `comment_count` basi.
 
 `bucket_date` (WIB, sumbu absolut), `days_since_post` (sumbu relatif = bucket_date − post_date), comment_count. Campaign Analysis → Comment timeline. Bucket pakai `comment_date` (WIB).
 
@@ -845,7 +846,7 @@ geo_level ('city'/'country'), geo_key, audience_count. Hasil unnest jsonb (pakai
 
 ### 4.13 `posting_time_heatmap`
 
-**Builder:** `sp_build_posting_time_heatmap()` · **PK:** `(platform, brand_id, weekday, hour)` · **brand_id = per-akun** (TIDAK di-roll-up) · **Duplicate handling: TRUNCATE + INSERT.**
+**Builder:** `sp_build_posting_time_heatmap()` · **PK:** `(platform, brand_id, weekday, hour)` · **brand_id = per-akun** (TIDAK di-roll-up) · **Duplicate handling: UPSERT** (`ON CONFLICT (platform, brand_id, weekday, hour) DO UPDATE`, ⚠️ diubah 2026-09-04 dari TRUNCATE+INSERT — dulu ini snapshot all-time yang sengaja di-TRUNCATE tiap build, lihat glosarium). **Trade-off:** kombinasi weekday×hour yang sudah tidak ada post lagi (mis. post-nya dihapus) tetap nyangkut dengan angka basi.
 
 post_count, engagement_sum, reach_sum, views_sum, er_denominator_sum. weekday 0=Minggu..6=Sabtu (WIB). Overview → Best Posting Times. FE warnai pakai avg engagement atau ER dari komponen.
 
@@ -954,7 +955,7 @@ Efeknya sama kayak `ON CONFLICT DO NOTHING` (seed nama baru doang, nggak nimpa e
 
 | Tabel | Builder | PK | brand_id | Duplicate handling | Fungsi |
 |---|---|---|---|---|---|
-| `ugc_tagged_posts` | `sp_build_ugc_tagged_posts()` | `(post_id, platform)` | umbrella | TRUNCATE+INSERT | Tagged Posts (UGC). IG-only. |
+| `ugc_tagged_posts` | `sp_build_ugc_tagged_posts()` | `(post_id, platform, brand_id)` | umbrella | UPSERT (⚠️ diubah 2026-09-04 dari TRUNCATE+INSERT — post yang tag-nya dicabut/dihapus tetap nyangkut) | Tagged Posts (UGC). IG-only. |
 | `v_campaign_posts` | VIEW (bukan tabel materialized) | on-demand | — | n/a (dihitung tiap query) | Campaign Analysis. |
 
 **`ugc_tagged_posts` (11 kolom):**
@@ -1113,8 +1114,8 @@ Kolom & tipe lengkap `unified_competitor_post` dan `unified_competitor_profile_d
 
 | Tabel | Grain | Builder | Duplicate handling |
 |---|---|---|---|
-| `unified_competitor_post` | (social_account_id, post_id) | `sp_sync_unified_competitor_post()` | **TRUNCATE + INSERT** |
-| `unified_competitor_profile_daily` | (social_account_id, metric_date) | `sp_sync_unified_competitor_profile_daily()` | **TRUNCATE + INSERT** |
+| `unified_competitor_post` | (social_account_id, post_id) | `sp_sync_unified_competitor_post()` | **UPSERT** (⚠️ diubah 2026-09-04, dulu TRUNCATE+INSERT) |
+| `unified_competitor_profile_daily` | (social_account_id, metric_date) | `sp_sync_unified_competitor_profile_daily()` | **UPSERT** (⚠️ diubah 2026-09-04, dulu TRUNCATE+INSERT) |
 
 ⚠️ **Ketersediaan metrik per platform di `unified_competitor_post` beda-beda** (dari komentar di SP, confirmed 10 Jul 2026) — jangan asumsikan semua platform lengkap:
 
@@ -1132,8 +1133,8 @@ Kolom & tipe lengkap `unified_competitor_post` dan `unified_competitor_profile_d
 
 | Tabel | Grain (UNIQUE) | Builder | Duplicate handling |
 |---|---|---|---|
-| `competitor_post_metric` | (brand_id, competitor_social_account_id, post_id) | `sp_build_competitor_post_metric()` | **TRUNCATE + INSERT** |
-| `competitor_profile_metric_daily` | (brand_id, competitor_social_account_id, metric_date) | `sp_build_competitor_profile_metric_daily()` | **TRUNCATE + INSERT** |
+| `competitor_post_metric` | (brand_id, competitor_social_account_id, post_id) | `sp_build_competitor_post_metric()` | **UPSERT** (⚠️ diubah 2026-09-04, dulu TRUNCATE+INSERT) |
+| `competitor_profile_metric_daily` | (brand_id, competitor_social_account_id, metric_date) | `sp_build_competitor_profile_metric_daily()` | **UPSERT** (⚠️ diubah 2026-09-04, dulu TRUNCATE+INSERT) |
 
 Keduanya resolve `brand_id` (= brand client yang melacak) lewat JOIN `public.brand_competitors` — bukan lewat `brand_social_accounts` kayak Gold brand utama.
 
