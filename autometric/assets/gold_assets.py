@@ -81,9 +81,14 @@ def post_metric(postgres: PostgresResource) -> Output:
 
 @asset(
     group_name="gold",
-    deps=[_COMMENT, _FEATURE],
+    # 2026-09-04: deps _FEATURE dihapus -- sp_build_comment_activity() cuma baca
+    # l1_silver.unified_comment + public.brand_social_accounts, TIDAK pernah
+    # menyentuh schema feature (dikonfirmasi dari definisi SP di DB). Deps lama
+    # bikin asset ini nunggu comment_relevance_scores (langkah NLP paling lambat)
+    # tanpa alasan -- sekarang bisa jalan paralel.
+    deps=[_COMMENT],
     kinds={"postgres"},
-    description="mart_comment_activity via sp_build_comment_activity(). Baca feature.",
+    description="mart_comment_activity via sp_build_comment_activity(). Independen dari Feature layer.",
 )
 def mart_comment_activity(postgres: PostgresResource) -> Output:
     return _build(postgres, "sp_build_comment_activity", "comment_activity_daily")

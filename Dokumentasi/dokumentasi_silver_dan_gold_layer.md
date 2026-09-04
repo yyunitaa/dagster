@@ -75,7 +75,7 @@ Dikonfirmasi dari kode asset terbaru (`silver_assets.py`, `harmonization_assets.
 | Feature | `comment_sentiment_scores` | `unified_comment` saja | Nggak butuh caption/post |
 | Gold | `mart_brand_metric_daily` → `brand_metric_daily` | `unified_post`, `unified_comment`, `unified_profile` | |
 | Gold | `post_metric` | `unified_post` | |
-| Gold | `mart_comment_activity` → `comment_activity_daily`+`_hourly` | `unified_comment`, `comment_relevance_scores` (Feature) | 1 SP isi 2 tabel |
+| Gold | `mart_comment_activity` → `comment_activity_daily`+`_hourly` | `unified_comment` | 1 SP isi 2 tabel. ⚠️ Dep ke `comment_relevance_scores` (Feature) DIHAPUS 2026-09-04 — SP-nya tidak pernah baca schema `feature`, dep lama cuma bikin nunggu NLP step tanpa alasan. Sekarang bisa jalan paralel dengan Feature layer. |
 | Gold | `mart_community_contributors` → `community_contributors` | `unified_post`, `unified_comment`, `comment_relevance_scores` (Feature) | Sengaja setelah NLP |
 | Gold | `mart_content_attributes` → `content_attribute_daily` | `unified_post` | |
 | Gold | `mart_pillar_performance` → `pillar_performance_daily` | `unified_post`, `unified_story` | |
@@ -424,17 +424,17 @@ Output NLP, di antara Silver & Gold. **Tidak ada stored procedure di schema `fea
 
 | Tabel | Asset Dagster | Duplicate handling | Kenapa |
 |---|---|---|---|
-| `comment_relevance_scores` | `comment_relevance_scores` | **TRUNCATE + INSERT** (REPLACE penuh) | Cosine similarity murah dihitung ulang — simpel & cocok volume saat ini |
-| `word_frequencies` | `comment_relevance_scores` (1 asset, 2 tabel) | **TRUNCATE + INSERT** (REPLACE penuh) | sama seperti di atas — 1 asset Python nulis ke 2 tabel sekaligus dalam 1 transaksi |
-| `comment_sentiment_scores` | `comment_sentiment_scores` | **UPSERT** (`ON CONFLICT (comment_id, platform) DO UPDATE`) — **satu-satunya yang incremental** | Inference transformer (IndoRoBERTa) jauh lebih berat daripada cosine similarity — re-score seluruh histori tiap run boros compute. Query fetch-nya sendiri cuma ambil comment yang **belum** ada skornya (`LEFT JOIN ... WHERE s.comment_id IS NULL`). |
+| `comment_relevance_scores` | `comment_relevance_scores` | **INCREMENTAL** (`INSERT ... ON CONFLICT DO NOTHING`, ⚠️ diubah 2026-09-04, dulu TRUNCATE+INSERT) | Encode ulang SEMUA histori tiap run makin lambat seiring histori bertambah — sekarang cuma comment yang **belum** ada skornya yang di-fetch+encode (`LEFT JOIN ... WHERE s.comment_id IS NULL`, pola sama persis `comment_sentiment_scores`). Caption yang berubah setelah comment discore TIDAK memicu re-score otomatis. |
+| `word_frequencies` | `comment_relevance_scores` (1 asset, 2 tabel) | **TRUNCATE + INSERT** (REPLACE penuh, TIDAK diubah) | Regex tokenize + Counter itu murah (bukan model inference) — tetap scan SEMUA comment tiap run supaya top-N kata per brand/platform akurat mencakup seluruh histori. |
+| `comment_sentiment_scores` | `comment_sentiment_scores` | **UPSERT** (`ON CONFLICT (comment_id, platform) DO UPDATE`) | Inference transformer (IndoRoBERTa) jauh lebih berat daripada cosine similarity — re-score seluruh histori tiap run boros compute. Query fetch-nya sendiri cuma ambil comment yang **belum** ada skornya (`LEFT JOIN ... WHERE s.comment_id IS NULL`) — pola yang sejak 2026-09-04 juga dipakai `comment_relevance_scores`. |
 
 Setelah `comment_relevance_scores`+`word_frequencies` selesai ditulis, asset ini **invalidate cache Redis** (`dash:{brand_id}:*`) untuk tiap brand yang datanya berubah. ⚠️ Ini satu-satunya asset di seluruh pipeline yang eksplisit invalidate Redis — asset Gold lain (termasuk `comment_sentiment_daily`/`_post`) nggak melakukan ini di kode yang ada, jadi kalau dashboard kelihatan nge-cache data sentiment yang basi, ini kemungkinan penyebabnya (bukan bug SP, tapi memang belum ada invalidation-nya).
 
 ### `comment_relevance_scores`
 
-**PK:** `(comment_id, platform)` · **Duplicate handling: TRUNCATE + INSERT.** · **Asset deps:** `unified_comment` + `unified_post` (butuh caption post induk).
+**PK:** `(comment_id, platform)` · **Duplicate handling: INCREMENTAL** (`ON CONFLICT DO NOTHING`, ⚠️ diubah 2026-09-04, dulu TRUNCATE+INSERT). · **Asset deps:** `unified_comment` + `unified_post` (butuh caption post induk).
 
-Skor cosine similarity komentar vs caption post induk (SentenceTransformer, model `paraphrase-multilingual-MiniLM-L12-v2`, dimuat sekali per run lewat `setup_for_execution`). Butuh caption post induk (join `post_id`, `platform`). Comment tanpa teks (`comment_text IS NULL/''`) di-skip.
+Skor cosine similarity komentar vs caption post induk (SentenceTransformer, model `paraphrase-multilingual-MiniLM-L12-v2`, dimuat sekali per run lewat `setup_for_execution`). Butuh caption post induk (join `post_id`, `platform`). Comment tanpa teks (`comment_text IS NULL/''`) di-skip. Cuma comment yang **belum** ada baris di tabel ini yang di-encode tiap run — comment lama tidak di-re-score walau captionnya berubah belakangan.
 
 **Kolom & tipe (5 kolom):**
 

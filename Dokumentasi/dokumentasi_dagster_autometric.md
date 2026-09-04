@@ -142,8 +142,8 @@ harian), jadi guard 25 jam akan sering false-alarm kalau dipasang.
 
 | Asset | Depend pada | Isi | Strategi tulis |
 |---|---|---|---|
-| `comment_relevance_scores` | `unified_comment`, `unified_post` | Skor relevansi comment vs caption (0–100, cosine similarity) **+** `word_frequencies` (top-50 kata per brand/platform) | **REPLACE penuh** (TRUNCATE + INSERT), lalu invalidate cache Redis per brand yang datanya berubah |
-| `comment_sentiment_scores` | `unified_comment` | Label sentimen komentar (positive/neutral/negative) pakai model IndoRoBERTa | **INCREMENTAL (UPSERT)** — beda dari asset di atas, karena inference transformer jauh lebih berat daripada cosine similarity; re-score seluruh histori tiap run bakal boros compute |
+| `comment_relevance_scores` | `unified_comment`, `unified_post` | Skor relevansi comment vs caption (0–100, cosine similarity) **+** `word_frequencies` (top-50 kata per brand/platform) | Relevansi: **INCREMENTAL** (`ON CONFLICT DO NOTHING`, ⚠️ diubah 2026-09-04 dari REPLACE penuh — encode ulang semua histori tiap run makin lambat seiring data bertambah). `word_frequencies`: tetap REPLACE penuh (murah, bukan model inference). Lalu invalidate cache Redis per brand yang datanya berubah |
+| `comment_sentiment_scores` | `unified_comment` | Label sentimen komentar (positive/neutral/negative) pakai model IndoRoBERTa | **INCREMENTAL (UPSERT)** — pola yang sama sekarang juga dipakai `comment_relevance_scores` di atas, karena alasan yang sama: inference/encoding jauh lebih berat daripada re-fetch data, jadi re-proses seluruh histori tiap run boros compute |
 
 Kedua asset skip comment yang teksnya kosong/NULL.
 
@@ -159,7 +159,7 @@ diisi via UPSERT/REPLACE di dalam stored procedure masing-masing.
 |---|---|---|
 | `mart_brand_metric_daily` | post, comment, profile | Tren engagement harian |
 | `post_metric` | post | Metrik per-post (engagement owned/public + 4 jenis ER). Developer query langsung. |
-| `mart_comment_activity` | comment, `comment_relevance_scores` | Aktivitas komentar harian |
+| `mart_comment_activity` | comment | Aktivitas komentar harian. ⚠️ Dep ke `comment_relevance_scores` dihapus 2026-09-04 (SP-nya tidak baca schema `feature`) |
 | `mart_community_contributors` | post, comment, `comment_relevance_scores` | Kontributor komunitas (jalan setelah NLP) |
 | `mart_content_attributes` | post | Atribut konten harian |
 | `mart_pillar_performance` | post, story | Performa content pillar |
@@ -210,8 +210,15 @@ penuh dari awal sampai akhir:
 | **2** | `unified_profile`, `unified_audience`, `unified_story`, `unified_tagged_post`, `unified_competitor_post`, `unified_competitor_profile_daily` |
 | **3** | `unified_post`, `mart_story_funnel`, `mart_tiktok_churn`, `ugc_tagged_posts`, `audience_demographics_daily`, `audience_geo_daily`, `competitor_post_metric` |
 | **4** | `unified_comment`, `post_metric`, `mart_content_attributes`, `posting_time_heatmap`, `mart_pillar_performance`, `competitor_profile_metric_daily` |
-| **5** | `comment_relevance_scores`, `comment_sentiment_scores`, `mart_brand_metric_daily`, `post_comment_timeline`, `post_wordcloud`, `dim_content_pillar` |
-| **6** *(terakhir)* | `mart_comment_activity`, `mart_community_contributors`, `comment_relevance_distribution`, `comment_sentiment_daily`, `comment_sentiment_post` |
+| **5** | `comment_relevance_scores`, `comment_sentiment_scores`, `mart_brand_metric_daily`, `post_comment_timeline`, `post_wordcloud`, `dim_content_pillar`, `mart_comment_activity` |
+| **6** *(terakhir)* | `mart_community_contributors`, `comment_relevance_distribution`, `comment_sentiment_daily`, `comment_sentiment_post` |
+
+⚠️ **Diubah 2026-09-04:** `mart_comment_activity` pindah dari wave 6 ke wave 5 —
+dependency-nya ke `comment_relevance_scores` (Feature) dihapus karena SP-nya
+(`sp_build_comment_activity`) ternyata tidak pernah baca schema `feature` sama
+sekali (cuma `l1_silver.unified_comment` + `public.brand_social_accounts`).
+Sekarang dia jalan **paralel** dengan `comment_relevance_scores`, bukan nunggu
+NLP step (yang paling lambat di seluruh pipeline) kelar duluan tanpa alasan.
 
 Poin yang tidak kelihatan dari tabel per-layer di Bagian 3.2–3.6:
 
@@ -220,14 +227,20 @@ Poin yang tidak kelihatan dari tabel per-layer di Bagian 3.2–3.6:
   (untuk kolom `followers_on_post_day`).
 - **`mart_pillar_performance` (wave 4) harus kelar sebelum `dim_content_pillar`
   (wave 5)** — satu-satunya dependency Gold→Gold di seluruh pipeline.
-- **`mart_comment_activity` dan `mart_community_contributors` jadi yang paling
-  terakhir (wave 6)** — nunggu `comment_relevance_scores` (hasil NLP, wave 5), yang
-  sendirinya nunggu `unified_comment` (wave 4).
+- **`mart_community_contributors` jadi yang paling terakhir (wave 6)** — nunggu
+  `comment_relevance_scores` (hasil NLP, wave 5), yang sendirinya nunggu
+  `unified_comment` (wave 4). `mart_comment_activity` TIDAK lagi ikut nunggu di sini
+  (lihat catatan di atas).
 - **Rantai terpanjang** (critical path) di seluruh pipeline: `l0_raw` →
   `harmonized_profile` → `unified_profile` → `unified_post` → `unified_comment` →
-  `comment_relevance_scores` → `mart_comment_activity` (6 langkah setelah raw). Ini
-  yang menentukan berapa lama minimal `daily_pipeline_job` bisa selesai, meskipun
-  banyak resource tersedia untuk paralelisasi.
+  `comment_relevance_scores` → `mart_community_contributors` (6 langkah setelah raw,
+  ⚠️ endpoint-nya berubah dari `mart_comment_activity`, tapi panjang rantai tetap
+  sama — `comment_relevance_scores` masih jadi bottleneck utama). Ini yang menentukan
+  berapa lama minimal `daily_pipeline_job` bisa selesai, meskipun banyak resource
+  tersedia untuk paralelisasi. **Fix paling berdampak buat mempercepat pipeline
+  secara keseluruhan: percepat `comment_relevance_scores` sendiri** (mis. sudah
+  diubah 2026-09-04 jadi incremental — lihat §3.4) — bukan cuma menghilangkan
+  dependency yang tidak perlu.
 
 ---
 

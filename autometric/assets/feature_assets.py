@@ -2,13 +2,20 @@
 Feature assets — output NLP ditulis balik ke warehouse (schema feature).
 
 Langkah 15:
-  - comment_relevance_scores: cosine(comment_text, caption) -> 0-100, REPLACE penuh.
-  - word_frequencies: top-50 kata per (brand, platform), REPLACE penuh.
+  - comment_relevance_scores: cosine(comment_text, caption) -> 0-100.
+    ⚠️ Diubah 2026-09-04 dari REPLACE penuh ke INCREMENTAL (UPSERT) -- sebelumnya
+    encode ULANG SEMUA histori komentar tiap run (linear makin lambat seiring
+    histori bertambah), padahal comment_sentiment_scores di sebelahnya sudah lama
+    incremental dengan pola yang sama. Sekarang cuma comment yang BELUM ada skornya
+    yang di-encode (LEFT JOIN ... WHERE s.comment_id IS NULL, sama pola dengan
+    _fetch_comments_for_sentiment). Caption yang berubah SETELAH komentar sudah
+    discore TIDAK memicu re-score otomatis -- trade-off yang diterima karena caption
+    post jarang berubah setelah publish.
+  - word_frequencies: top-50 kata per (brand, platform), TETAP REPLACE penuh --
+    ini cuma regex tokenize + Counter (murah, bukan model inference), dan perlu
+    scan SEMUA komentar tiap run supaya top-N kata akurat mencakup seluruh histori.
   - Jalan SETELAH unified_comment & unified_post.
   - Setelah tulis, invalidate cache Redis tiap brand yang datanya berubah.
-
-Strategi: REPLACE penuh (TRUNCATE + INSERT) sesuai keputusan — simpel, cocok untuk
-volume saat ini. Mudah diubah ke incremental nanti.
 
 Tambahan — comment_sentiment_scores:
   - Sentimen komentar (positive/neutral/negative) pakai model IndoRoBERTa
@@ -46,6 +53,28 @@ def _fetch_comments(postgres: PostgresResource) -> list[dict]:
                 SELECT comment_id, platform, brand_id::text, post_id, comment_text
                 FROM l1_silver.unified_comment
                 WHERE comment_text IS NOT NULL AND comment_text <> ''
+            """)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _fetch_new_comments_for_relevance(postgres: PostgresResource) -> list[dict]:
+    """Ambil comment yang BELUM punya skor relevansi (incremental, sama pola
+    seperti _fetch_comments_for_sentiment). Butuh post_id (beda dari fetch
+    sentiment) karena relevansi butuh JOIN ke caption post induk. Comment
+    tanpa teks di-skip."""
+    conn = postgres.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.comment_id, c.platform, c.brand_id::text, c.post_id, c.comment_text
+                FROM l1_silver.unified_comment c
+                LEFT JOIN feature.comment_relevance_scores s
+                    ON s.comment_id = c.comment_id AND s.platform = c.platform
+                WHERE s.comment_id IS NULL
+                  AND c.comment_text IS NOT NULL AND c.comment_text <> ''
             """)
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -93,26 +122,36 @@ def _fetch_comments_for_sentiment(postgres: PostgresResource) -> list[dict]:
     group_name="feature",
     deps=[AssetKey("unified_comment"), AssetKey("unified_post")],  # Langkah 15: setelah keduanya
     kinds={"postgres", "python"},
-    description="Skor relevansi comment vs caption (0-100) + word frequencies. REPLACE penuh, lalu invalidate Redis.",
+    description=(
+        "Skor relevansi comment vs caption (0-100), INCREMENTAL (UPSERT, sejak "
+        "2026-09-04) -- cuma comment yang belum discore yang di-encode. "
+        "+ word_frequencies (REPLACE penuh, murah). Invalidate Redis untuk brand yang berubah."
+    ),
 )
 def comment_relevance_scores(
     postgres: PostgresResource,
     nlp_model: SentenceTransformerResource,
     redis: RedisResource,
 ) -> Output:
-    # 1. Ambil data dari Silver.
-    comments = _fetch_comments(postgres)
+    # 1. Ambil comment BARU yang belum discore (incremental -- bagian mahal/encode).
+    new_comments = _fetch_new_comments_for_relevance(postgres)
     captions = _fetch_captions(postgres)
 
-    # 2. Hitung (CPU/GPU-bound, model sudah dimuat sekali oleh resource).
-    relevance_rows = compute_relevance_scores(comments, captions, nlp_model.model)
-    word_rows = compute_word_frequencies(comments, top_n=50)
+    # 2. Hitung skor cuma utk comment baru (CPU/GPU-bound, model sudah dimuat
+    #    sekali oleh resource).
+    relevance_rows = compute_relevance_scores(new_comments, captions, nlp_model.model)
 
-    # 3. Tulis REPLACE penuh dalam satu transaksi.
+    # 3. Word frequencies TETAP full recompute -- regex tokenize + Counter itu
+    #    murah (bukan model inference), dan perlu SEMUA comment biar top-N kata
+    #    per brand/platform akurat mencakup seluruh histori.
+    all_comments = _fetch_comments(postgres)
+    word_rows = compute_word_frequencies(all_comments, top_n=50)
+
+    # 4. Tulis: relevance INCREMENTAL (UPSERT, tanpa TRUNCATE), word_frequencies
+    #    tetap REPLACE penuh -- keduanya dalam satu transaksi.
     conn = postgres.get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("TRUNCATE feature.comment_relevance_scores")
             if relevance_rows:
                 execute_values(
                     cur,
@@ -146,7 +185,8 @@ def comment_relevance_scores(
     finally:
         conn.close()
 
-    # 4. Invalidate Redis untuk tiap brand yang muncul di hasil.
+    # 5. Invalidate Redis untuk tiap brand yang datanya berubah (comment baru
+    #    discore, ATAU word frequencies-nya berubah karena histori baru).
     brands = {r["brand_id"] for r in relevance_rows} | {r["brand_id"] for r in word_rows}
     deleted = 0
     for b in brands:
@@ -155,9 +195,10 @@ def comment_relevance_scores(
     return Output(
         len(relevance_rows),
         metadata={
-            "relevance_rows": len(relevance_rows),
+            "new_relevance_rows": len(relevance_rows),
+            "new_comments_scanned": len(new_comments),
             "word_freq_rows": len(word_rows),
-            "comments_scanned": len(comments),
+            "comments_scanned_for_wordfreq": len(all_comments),
             "captions_available": len(captions),
             "brands_invalidated": len(brands),
             "redis_keys_deleted": deleted,
